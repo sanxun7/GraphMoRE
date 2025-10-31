@@ -39,6 +39,10 @@ parser.add_argument('--n_heads', type=int, default=8, help='number of attention 
 
 # Gating
 parser.add_argument('--sample_hop', type=int, nargs='+',default=[2,3])
+parser.add_argument('--sample_method', type=str, default='ego', choices=['ego','rl'])
+parser.add_argument('--rl_steps', type=int, default=10, help='RL agent steps to build subgraph')
+parser.add_argument('--rl_budget', type=float, default=0.2, help='fraction of nodes to select as budget')
+parser.add_argument('--epsilon', type=float, default=0.1, help='epsilon for epsilon-greedy policy')
 parser.add_argument('--lr_gating', type=float, default=0.01)
 parser.add_argument('--w_decay_gating', type=float, default=5e-4)
 parser.add_argument('--coef_dis', type=float, default=0.1)

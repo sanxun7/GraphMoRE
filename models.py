@@ -177,6 +177,10 @@ class Sampler():
         self.sample_hop = sample_hop
         self.dataset = dataset
         self.configs = configs
+        # RL components (lazy init)
+        self.policy = None
+        self.policy_optimizer = None
+        self.prev_score = 0.0
     def sample(self, feature, edge_index, task):
         if self.method == "ego":
             new_feature_list, new_edge_index_list, batch_list = [], [], []
@@ -186,6 +190,8 @@ class Sampler():
                 new_edge_index_list.append(new_edge_index)
                 batch_list.append(batch)
             return new_feature_list, new_edge_index_list, batch_list
+        if self.method == "rl":
+            return self.sample_rl(feature, edge_index)
         return None
     
     def sample_ego(self, feature, edge_index, k_hop):
@@ -216,3 +222,95 @@ class Sampler():
         batch = torch.cat(batches, dim=0).cuda()
 
         return new_feature, new_edge_index, batch
+
+    def sample_rl(self, feature, edge_index):
+        device = feature.device
+        num_nodes = feature.shape[0]
+        
+        # For LP task, edge_index is actually edges; for NC it's edges too
+        # We need full graph for ego sampling
+        # Build full graph from edge_index
+        G = nx.Graph()
+        edges_py = [(edge_index[0][i].item(), edge_index[1][i].item()) for i in range(edge_index.size(1))]
+        G.add_nodes_from(range(num_nodes))
+        G.add_edges_from(edges_py)
+
+        # Lazy init policy
+        in_dim = feature.shape[1]
+        if self.policy is None:
+            self.policy = nn.Sequential(
+                nn.Linear(in_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 2)
+            ).to(device)
+            self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-3)
+
+        self.policy.train()
+        epsilon = getattr(self.configs, 'epsilon', 0.1) if self.configs is not None else 0.1
+        rl_steps = getattr(self.configs, 'rl_steps', 10) if self.configs is not None else 10
+
+        # Match ego behavior: sample ego subgraph for each node
+        new_features = []
+        new_edge_indices = []
+        batches = []
+        offset = 0
+        
+        # Use average hop from self.sample_hop as k_hop
+        k_hop = int(np.mean(self.sample_hop)) if len(self.sample_hop) > 0 else 2
+        
+        for node in G.nodes():
+            subgraph = nx.ego_graph(G, node, radius=k_hop)
+            sub_nodes = list(subgraph.nodes)
+            
+            # RL: decide whether to keep or shrink this ego subgraph
+            if len(sub_nodes) < 2:
+                sel_nodes = sub_nodes
+            else:
+                # Apply RL policy to select subset of nodes in ego subgraph
+                sub_features = feature[sub_nodes]
+                logits = self.policy(sub_features)
+                probs = F.softmax(logits, dim=-1)
+                include_scores = probs[:, 1]
+                
+                # Simple strategy: keep top-k nodes by policy score, or random with epsilon
+                budget_sub = max(2, int(0.5 * len(sub_nodes)))
+                if torch.rand(1).item() < epsilon:
+                    pick_indices = torch.randperm(len(sub_nodes), device=device)[:budget_sub]
+                else:
+                    _, pick_indices = torch.topk(include_scores, k=budget_sub)
+                
+                sel_nodes_indices = pick_indices.cpu().tolist()
+                sel_nodes = [sub_nodes[i] for i in sel_nodes_indices]
+            
+            # Build subgraph features and edges
+            subgraph_feature = feature[sel_nodes]
+            new_features.append(subgraph_feature)
+            
+            new_node_indices = {node: idx + offset for idx, node in enumerate(sel_nodes)}
+            sub_edges = []
+            for u, v in subgraph.subgraph(sel_nodes).edges():
+                sub_edges.append([new_node_indices[u], new_node_indices[v]])
+            
+            if len(sub_edges) == 0:
+                sub_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            else:
+                sub_edge_index = torch.tensor(sub_edges, dtype=torch.long, device=device).t().contiguous()
+            new_edge_indices.append(sub_edge_index)
+            
+            offset += len(sel_nodes)
+            subgraph_batch = torch.tensor([node] * subgraph_feature.shape[0], dtype=torch.long, device=device)
+            batches.append(subgraph_batch)
+
+        # Concatenate all subgraphs
+        new_feature = torch.cat(new_features, dim=0)
+        new_edge_index = torch.cat(new_edge_indices, dim=1)
+        batch = torch.cat(batches, dim=0)
+
+        # Return in same format as ego: list of scales
+        new_feature_list, new_edge_index_list, batch_list = [], [], []
+        for k in self.sample_hop:
+            new_feature_list.append(new_feature)
+            new_edge_index_list.append(new_edge_index)
+            batch_list.append(batch)
+        
+        return new_feature_list, new_edge_index_list, batch_list

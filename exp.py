@@ -45,7 +45,7 @@ class Exp:
         val_prop = 0.05
         test_prop = 0.1
         self.pos_edges, self.neg_edges = mask_edges(self.edge_index, self.neg_edge, val_prop, test_prop)
-        self.subgraph_sampler = Sampler(method = "ego", sample_hop = self.configs.sample_hop, dataset = self.configs.dataset, configs = self.configs)
+        self.subgraph_sampler = Sampler(method = self.configs.sample_method, sample_hop = self.configs.sample_hop, dataset = self.configs.dataset, configs = self.configs)
 
 
         if self.configs.downstream_task == "NC":
