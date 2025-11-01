@@ -4,6 +4,7 @@ import os
 import random
 import argparse
 from exp import Exp
+from datetime import datetime
 from logger import create_logger
 from typing import Union
 
@@ -43,6 +44,9 @@ parser.add_argument('--sample_method', type=str, default='ego', choices=['ego','
 parser.add_argument('--rl_steps', type=int, default=10, help='RL agent steps to build subgraph')
 parser.add_argument('--rl_budget', type=float, default=0.2, help='fraction of nodes to select as budget')
 parser.add_argument('--epsilon', type=float, default=0.1, help='epsilon for epsilon-greedy policy')
+parser.add_argument('--history_len', type=int, default=5, help='RL history window size m')
+parser.add_argument('--rl_gamma', type=float, default=0.99, help='RL discount factor')
+parser.add_argument('--rl_lr', type=float, default=1e-3, help='RL Q-network learning rate')
 parser.add_argument('--lr_gating', type=float, default=0.01)
 parser.add_argument('--w_decay_gating', type=float, default=5e-4)
 parser.add_argument('--coef_dis', type=float, default=0.1)
@@ -76,7 +80,10 @@ configs.num_factors = len(configs.init_curvs)
 configs.num_factors_cls = configs.num_factors
 
 results_dir = f"./results/{configs.version}"
-log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}.log"
+
+# Generate unique log filename with timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}_{timestamp}.log"
 
 configs.log_path = log_path
 if not os.path.exists("./results"):
@@ -91,4 +98,3 @@ logger.info(configs)
 exp = Exp(configs)
 exp.train()
 torch.cuda.empty_cache()
-

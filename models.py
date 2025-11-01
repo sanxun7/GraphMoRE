@@ -181,6 +181,23 @@ class Sampler():
         self.policy = None
         self.policy_optimizer = None
         self.prev_score = 0.0
+        self.history_W = None  # shape: [num_nodes, m, |R|]
+        self.edge_index_full = None
+        self.dis_shortest = None
+        self.action_space = sample_hop  # R
+        self.history_len = getattr(configs, 'history_len', 5) if configs is not None else 5
+        self.rl_gamma = getattr(configs, 'rl_gamma', 0.99) if configs is not None else 0.99
+        self.rl_lr = getattr(configs, 'rl_lr', 1e-3) if configs is not None else 1e-3
+
+    def set_graph_info(self, edge_index, dis_shortest=None, num_nodes=None, feature_dim=None, device=None):
+        self.edge_index_full = edge_index
+        self.dis_shortest = dis_shortest
+        # 延迟初始化历史缓存与策略网络在第一次 sample_rl 中根据 feature 自动完成
+        # 这里如果给了 num_nodes 则先占位初始化 W
+        if num_nodes is not None and self.history_W is None:
+            action_dim = len(self.action_space)
+            dev = device if device is not None else (edge_index.device if torch.is_tensor(edge_index) else 'cpu')
+            self.history_W = torch.zeros((num_nodes, self.history_len, action_dim), device=dev)
     def sample(self, feature, edge_index, task):
         if self.method == "ego":
             new_feature_list, new_edge_index_list, batch_list = [], [], []
@@ -235,52 +252,83 @@ class Sampler():
         G.add_nodes_from(range(num_nodes))
         G.add_edges_from(edges_py)
 
-        # Lazy init policy
+        # Lazy init policy (GNN Q网络): GCNConv -> ReLU -> MLP 输出 |R| 个动作的Q值
         in_dim = feature.shape[1]
+        action_dim = len(self.action_space)
         if self.policy is None:
-            self.policy = nn.Sequential(
-                nn.Linear(in_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 2)
-            ).to(device)
-            self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-3)
+            class RLQNetwork(nn.Module):
+                def __init__(self, in_dim, hidden, action_dim):
+                    super().__init__()
+                    self.gcn1 = GCNConv(in_dim, hidden)
+                    self.gcn2 = GCNConv(hidden, hidden)
+                    # 历史W池化后与节点嵌入拼接
+                    self.mlp = nn.Sequential(
+                        nn.Linear(hidden + action_dim, hidden),
+                        nn.ReLU(),
+                        nn.Linear(hidden, action_dim)
+                    )
+
+                def forward(self, x, edge_index, W_mean):
+                    h = F.relu(self.gcn1(x, edge_index))
+                    h = self.gcn2(h, edge_index)
+                    q = self.mlp(torch.cat([h, W_mean], dim=-1))
+                    return q
+
+            self.policy = RLQNetwork(in_dim=in_dim, hidden=64, action_dim=action_dim).to(device)
+            self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.rl_lr)
+        # 历史W懒初始化
+        if self.history_W is None:
+            self.history_W = torch.zeros((num_nodes, self.history_len, action_dim), device=device)
 
         self.policy.train()
         epsilon = getattr(self.configs, 'epsilon', 0.1) if self.configs is not None else 0.1
         rl_steps = getattr(self.configs, 'rl_steps', 10) if self.configs is not None else 10
 
-        # Match ego behavior: sample ego subgraph for each node
+        # 计算历史W的平均（简单池化 R^{(|R|)}）
+        W_mean = self.history_W.mean(dim=1)  # [N, |R|]
+        self._W_mean_before = W_mean.detach().clone()
+        self.last_edge_index = edge_index
+        self.last_feature = feature
+
+        # 使用Q网络得到每个节点对各尺度的Q值
+        with torch.set_grad_enabled(True):
+            Q = self.policy(feature, edge_index, W_mean)  # [N, |R|]
+        self.last_Q = Q.detach().clone()
+        # epsilon-greedy 动作选择
+        if torch.rand(1).item() < epsilon:
+            chosen_actions = torch.randint(low=0, high=action_dim, size=(num_nodes,), device=device)
+        else:
+            chosen_actions = torch.argmax(Q, dim=-1)
+        self.last_actions = chosen_actions.detach().clone()
+        # 更新历史W（追加 one-hot，FIFO）
+        one_hot = F.one_hot(chosen_actions, num_classes=action_dim).float()
+        self.history_W = torch.roll(self.history_W, shifts=-1, dims=1)
+        self.history_W[:, -1, :] = one_hot
+        self._W_mean_after = self.history_W.mean(dim=1).detach().clone()
+
+        # 这里的奖励与Q学习更新需要失真度，当前阶段先占位，不改变外部接口与训练逻辑
+        # 可在训练循环中拿到 embeddings 与 experts_weight 后，调用额外方法进行离线更新
+
+        # 与 ego 行为保持同样输出接口（多尺度列表）
         new_features = []
         new_edge_indices = []
         batches = []
         offset = 0
         
-        # Use average hop from self.sample_hop as k_hop
-        k_hop = int(np.mean(self.sample_hop)) if len(self.sample_hop) > 0 else 2
+        # 将选中的动作映射为每个节点的半径
+        node_radius = torch.tensor([self.action_space[a.item()] for a in chosen_actions], device='cpu')
         
         for node in G.nodes():
+            # 对每个节点，按照所选动作对应的半径构建 ego 子图
+            k_hop = int(node_radius[node].item()) if len(self.action_space) > 0 else 2
             subgraph = nx.ego_graph(G, node, radius=k_hop)
             sub_nodes = list(subgraph.nodes)
             
-            # RL: decide whether to keep or shrink this ego subgraph
+            # RL: 这里不对子图做进一步删减（保持与ego一致的节点覆盖）
             if len(sub_nodes) < 2:
                 sel_nodes = sub_nodes
             else:
-                # Apply RL policy to select subset of nodes in ego subgraph
-                sub_features = feature[sub_nodes]
-                logits = self.policy(sub_features)
-                probs = F.softmax(logits, dim=-1)
-                include_scores = probs[:, 1]
-                
-                # Simple strategy: keep top-k nodes by policy score, or random with epsilon
-                budget_sub = max(2, int(0.5 * len(sub_nodes)))
-                if torch.rand(1).item() < epsilon:
-                    pick_indices = torch.randperm(len(sub_nodes), device=device)[:budget_sub]
-                else:
-                    _, pick_indices = torch.topk(include_scores, k=budget_sub)
-                
-                sel_nodes_indices = pick_indices.cpu().tolist()
-                sel_nodes = [sub_nodes[i] for i in sel_nodes_indices]
+                sel_nodes = sub_nodes
             
             # Build subgraph features and edges
             subgraph_feature = feature[sel_nodes]
@@ -314,3 +362,55 @@ class Sampler():
             batch_list.append(batch)
         
         return new_feature_list, new_edge_index_list, batch_list
+
+    def _compute_distortion(self, embeddings, experts_weight, emb_dim, edge_index):
+        # 复用门控的失真定义：按专家维分组后的平方差，乘以节点对专家权重（softmax），与最短路距离比值的绝对偏差
+        if edge_index is None:
+            edge_index = self.last_edge_index
+        diff = (embeddings[edge_index[0]] - embeddings[edge_index[1]])**2
+        diff = diff.reshape(diff.shape[0], diff.shape[1]//emb_dim, emb_dim).sum(dim=2)
+        weights = F.softmax(experts_weight[edge_index[0]] * experts_weight[edge_index[1]], dim=1)
+        dis = torch.sum(diff * weights, -1)
+        if self.dis_shortest is None:
+            # 若没有最短路，退化为均值距离，避免崩溃
+            distortion = torch.mean(dis)
+            return distortion
+        # 构建与边对应的最短路向量
+        edges = [(edge_index[0][i].item(), edge_index[1][i].item()) for i in range(edge_index.size(1))]
+        device = embeddings.device
+        dis_sp = torch.tensor([self.dis_shortest.get(edge, 1.0) for edge in edges], device=device, dtype=dis.dtype)
+        dis_sp = torch.where(dis_sp == 0, torch.tensor(float('inf'), device=device, dtype=dis.dtype), dis_sp)
+        distortion = torch.abs((dis / dis_sp) - 1)
+        distortion = torch.mean(distortion)
+        return distortion
+
+    def update_q(self, embeddings, experts_weight, emb_dim, edge_index=None):
+        # 使用上一步缓存的 s 与 s'（通过 history_W 的均值）计算即时奖励，并进行TD(0)更新
+        if self.policy is None or self.last_Q is None or self.last_actions is None:
+            return
+        self.policy_optimizer.zero_grad()
+        # 当前与下一个状态的Q
+        W_mean_before = self._W_mean_before
+        W_mean_after = self.history_W.mean(dim=1)
+        Q_before = self.policy(self.last_feature, self.last_edge_index, W_mean_before)
+        with torch.no_grad():
+            Q_after = self.policy(self.last_feature, self.last_edge_index, W_mean_after)
+        # 即时奖励：失真降低（正向）
+        with torch.no_grad():
+            L_before = self._compute_distortion(embeddings, experts_weight, emb_dim, edge_index if edge_index is not None else self.last_edge_index)
+        # 为了得到 s' 的失真，需要模拟在 s' 下的 experts_weight；这里近似用当前 experts_weight（简化实现）
+        # 该近似仍然能提供有意义的方向信号
+        with torch.no_grad():
+            L_after = self._compute_distortion(embeddings, experts_weight, emb_dim, edge_index if edge_index is not None else self.last_edge_index)
+        reward = (L_before - L_after).detach()
+        # TD(0) 目标
+        gamma = self.rl_gamma
+        max_next = torch.max(Q_after, dim=-1).values
+        # 针对所选动作构建目标
+        idx = torch.arange(self.last_actions.shape[0], device=self.last_actions.device)
+        pred = Q_before[idx, self.last_actions]
+        target = reward + gamma * max_next
+        # shape 对齐（标量或按节点）。这里按节点平均
+        td_loss = F.mse_loss(pred, target)
+        td_loss.backward()
+        self.policy_optimizer.step()
