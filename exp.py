@@ -46,11 +46,6 @@ class Exp:
         test_prop = 0.1
         self.pos_edges, self.neg_edges = mask_edges(self.edge_index, self.neg_edge, val_prop, test_prop)
         self.subgraph_sampler = Sampler(method = self.configs.sample_method, sample_hop = self.configs.sample_hop, dataset = self.configs.dataset, configs = self.configs)
-        # 注入图与最短路信息，便于RL状态/奖励使用
-        try:
-            self.subgraph_sampler.set_graph_info(self.edge_index, self.dis_shortest, num_nodes=self.features.size(0), feature_dim=self.features.size(1), device=device)
-        except Exception:
-            pass
 
 
         if self.configs.downstream_task == "NC":
@@ -64,9 +59,15 @@ class Exp:
 
 
         if self.configs.downstream_task == 'LP':
-            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.pos_edges[0], "LP")
+            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(
+                self.features, self.pos_edges[0], "LP", 
+                embeddings=None, dis_shortest=None, training=True
+            )
         else:
-            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.edge_index, "NC")
+            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(
+                self.features, self.edge_index, "NC",
+                embeddings=None, dis_shortest=None, training=True
+            )
 
         for exp_iter in range(self.configs.exp_iters):
             logger.info(f"\ntrain iters {exp_iter}")
@@ -133,17 +134,31 @@ class Exp:
             model_cls.train()
             model.train()
             model_gating.train()
+            
+            # 如果使用DQN采样，更新采样（基于当前embeddings）
+            if self.configs.sample_method == 'rl' and epoch % getattr(self.configs, 'rl_sample_freq', 10) == 0:
+                embeddings_temp = model.encode(self.features, self.edge_index, self.configs.dataset)
+                self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(
+                    self.features, self.edge_index, "NC",
+                    embeddings=embeddings_temp, 
+                    dis_shortest=self.dis_shortest, 
+                    training=True
+                )
+                # 训练DQN
+                if hasattr(self.subgraph_sampler, 'train_dqn'):
+                    dqn_loss = self.subgraph_sampler.train_dqn(
+                        batch_size=getattr(self.configs, 'dqn_batch_size', 32),
+                        gamma=getattr(self.configs, 'gamma', 0.99)
+                    )
+                    if dqn_loss is not None:
+                        logger.info(f"DQN loss: {dqn_loss:.4f}")
+            
             optimizer_cls.zero_grad()
             r_optim.zero_grad()
             optimizer_gating.zero_grad()
             
             embeddings = model.encode(self.features, self.edge_index, self.configs.dataset)
             experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
-            # RL Q更新（基于失真差的即时奖励）
-            try:
-                self.subgraph_sampler.update_q(embeddings, experts_weight, self.configs.embed_features, self.edge_index)
-            except Exception:
-                pass
 
             experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
             embeddings = embeddings * experts_weight
@@ -166,10 +181,6 @@ class Exp:
 
                 embeddings = model.encode(self.features, self.edge_index)
                 experts_weight = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch)
-                try:
-                    self.subgraph_sampler.update_q(embeddings, experts_weight, self.configs.embed_features, self.edge_index)
-                except Exception:
-                    pass
                 experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
                 embeddings = embeddings * experts_weight
                 features = torch.concat([self.features, embeddings], -1)
@@ -219,16 +230,30 @@ class Exp:
             t = time.time()
             model.train()
             model_gating.train()
+            
+            # 如果使用DQN采样，更新采样（基于当前embeddings）
+            if self.configs.sample_method == 'rl' and epoch % getattr(self.configs, 'rl_sample_freq', 10) == 0:
+                embeddings_temp = model(self.features, pos_edges[0])
+                self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(
+                    self.features, pos_edges[0], "LP",
+                    embeddings=embeddings_temp,
+                    dis_shortest=self.dis_shortest,
+                    training=True
+                )
+                # 训练DQN
+                if hasattr(self.subgraph_sampler, 'train_dqn'):
+                    dqn_loss = self.subgraph_sampler.train_dqn(
+                        batch_size=getattr(self.configs, 'dqn_batch_size', 32),
+                        gamma=getattr(self.configs, 'gamma', 0.99)
+                    )
+                    if dqn_loss is not None:
+                        logger.info(f"DQN loss: {dqn_loss:.4f}")
+            
             r_optim.zero_grad()
             optimizer_gating.zero_grad()
 
             embeddings = model(self.features, pos_edges[0])
             experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
-            # RL Q更新（训练期）
-            try:
-                self.subgraph_sampler.update_q(embeddings, experts_weight, self.configs.embed_features, pos_edges[0])
-            except Exception:
-                pass
             
             neg_edge_train = neg_edges[0][:, np.random.randint(0, neg_edges[0].shape[1], pos_edges[0].shape[1])]
             loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[0], neg_edge_train)
@@ -242,10 +267,6 @@ class Exp:
                 model_gating.eval()
                 embeddings = model(self.features, pos_edges[0])
                 experts_weight = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch)
-                try:
-                    self.subgraph_sampler.update_q(embeddings, experts_weight, self.configs.embed_features, pos_edges[0])
-                except Exception:
-                    pass
 
                 _, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[1], neg_edges[1])
                 logger.info(f"Epoch {epoch}: val_AUC={auc}, val_AP={ap}")
