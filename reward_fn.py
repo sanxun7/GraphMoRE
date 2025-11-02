@@ -27,12 +27,15 @@ class RewardFunction:
     def compute_task_reward_nc(self, accuracy, weighted_f1=None, macro_f1=None):
         """
         节点分类任务奖励
-        直接使用准确率作为奖励信号
+        加权组合：accuracy * 0.5 + weighted_f1 * 0.3 + macro_f1 * 0.2
         """
         reward = accuracy.item() if torch.is_tensor(accuracy) else accuracy
         
-        # 可选：结合F1分数
-        if weighted_f1 is not None:
+        # 加权组合三个指标
+        if weighted_f1 is not None and macro_f1 is not None:
+            reward = 0.5 * reward + 0.3 * weighted_f1 + 0.2 * macro_f1
+        elif weighted_f1 is not None:
+            # 如果没有macro_f1，使用accuracy和weighted_f1
             reward = 0.7 * reward + 0.3 * weighted_f1
         
         return reward
