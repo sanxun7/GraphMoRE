@@ -4,6 +4,7 @@ import os
 import random
 import argparse
 from exp import Exp
+from datetime import datetime
 from logger import create_logger
 from typing import Union
 
@@ -43,6 +44,22 @@ parser.add_argument('--lr_gating', type=float, default=0.01)
 parser.add_argument('--w_decay_gating', type=float, default=5e-4)
 parser.add_argument('--coef_dis', type=float, default=0.1)
 
+# DQN Settings
+parser.add_argument('--use_dqn', action='store_true', help='Use DQN for gating network')
+parser.add_argument('--replay_buffer_size', type=int, default=10000, help='Size of replay buffer')
+parser.add_argument('--batch_size_dqn', type=int, default=64, help='Batch size for DQN training')
+parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor for DQN')
+parser.add_argument('--epsilon_start', type=float, default=1.0, help='Initial epsilon for epsilon-greedy')
+parser.add_argument('--epsilon_end', type=float, default=0.01, help='Final epsilon for epsilon-greedy')
+parser.add_argument('--epsilon_decay', type=float, default=0.995, help='Epsilon decay rate (used if epsilon_decay_steps is not set)')
+parser.add_argument('--epsilon_decay_steps', type=int, default=None, help='Number of steps to decay from epsilon_start to epsilon_end (linear decay)')
+parser.add_argument('--epsilon_fixed', type=float, default=None, help='Fixed epsilon value (if set, epsilon will not decay)')
+parser.add_argument('--target_update_freq', type=int, default=10, help='Frequency of target network update')
+parser.add_argument('--dqn_update_freq', type=int, default=1, help='Frequency of DQN update')
+parser.add_argument('--tau', type=float, default=0.01, help='Soft update coefficient for target network')
+parser.add_argument('--coef_distortion_reward', type=float, default=1.0, help='Coefficient for distortion reward')
+parser.add_argument('--coef_task_reward', type=float, default=1.0, help='Coefficient for task performance reward')
+
 # Link Prediction
 parser.add_argument('--epochs_lp', type=int, default=5000)
 parser.add_argument('--patience_lp', type=int, default=100)
@@ -72,7 +89,8 @@ configs.num_factors = len(configs.init_curvs)
 configs.num_factors_cls = configs.num_factors
 
 results_dir = f"./results/{configs.version}"
-log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}.log"
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}_{timestamp}.log"
 
 configs.log_path = log_path
 if not os.path.exists("./results"):
@@ -87,4 +105,3 @@ logger.info(configs)
 exp = Exp(configs)
 exp.train()
 torch.cuda.empty_cache()
-
