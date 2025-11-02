@@ -103,4 +103,3 @@ logger.info(configs)
 exp = Exp(configs)
 exp.train()
 torch.cuda.empty_cache()
-
