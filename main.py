@@ -4,6 +4,7 @@ import os
 import random
 import argparse
 from exp import Exp
+from datetime import datetime
 from logger import create_logger
 from typing import Union
 
@@ -72,7 +73,8 @@ configs.num_factors = len(configs.init_curvs)
 configs.num_factors_cls = configs.num_factors
 
 results_dir = f"./results/{configs.version}"
-log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}.log"
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}_{timestamp}.log"
 
 configs.log_path = log_path
 if not os.path.exists("./results"):
