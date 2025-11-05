@@ -11,6 +11,7 @@ import scipy.sparse as sp
 import pickle as pkl
 import os
 import torch_geometric.transforms as T
+from torch_geometric.transforms import RandomLinkSplit
 import warnings
 warnings.filterwarnings('ignore')
 seed = 3047
@@ -83,6 +84,66 @@ def mask_edges(edge_index, neg_edges, val_prop, test_prop):
     val_edges_neg, test_edges_neg = neg_edges[:, :n_val], neg_edges[:, n_val:n_test + n_val]
     train_edges_neg = torch.concat([neg_edges, edge_val, edge_test], dim=-1)
     return (edge_train, edge_val, edge_test), (train_edges_neg, val_edges_neg, test_edges_neg)
+
+def mask_edges_random(edge_index, num_nodes, val_prop, test_prop, seed=3047):
+    """
+    使用 RandomLinkSplit 进行随机边划分（用于链接预测任务）
+    
+    Args:
+        edge_index: 原始边索引 [2, num_edges]
+        num_nodes: 节点数量
+        val_prop: 验证集比例
+        test_prop: 测试集比例
+        seed: 随机种子
+    
+    Returns:
+        pos_edges: (edge_train, edge_val, edge_test) 正边元组
+        neg_edges: (train_edges_neg, val_edges_neg, test_edges_neg) 负边元组
+    """
+    # 创建临时 Data 对象用于 RandomLinkSplit
+    temp_data = Data(edge_index=edge_index, num_nodes=num_nodes)
+    
+    # 设置随机种子
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # 使用 RandomLinkSplit 进行随机划分
+    # is_undirected=True 表示无向图，add_negative_train_samples=False 表示不在训练集中自动添加负样本
+    # neg_sampling_ratio=1.0 表示每个正样本对应一个负样本
+    transform = RandomLinkSplit(
+        num_val=val_prop,
+        num_test=test_prop,
+        is_undirected=True,
+        add_negative_train_samples=False,
+        neg_sampling_ratio=1.0,
+        split_labels=False
+    )
+    
+    train_data, val_data, test_data = transform(temp_data)
+    
+    # 提取训练集的边（只有正边）
+    edge_train = train_data.edge_index
+    
+    # 从验证集和测试集中分离正边和负边
+    # RandomLinkSplit 会在 edge_label_index 中包含所有边（正负样本），edge_label 包含标签
+    val_pos_mask = val_data.edge_label.bool()
+    val_pos_edges = val_data.edge_label_index[:, val_pos_mask]
+    val_neg_edges = val_data.edge_label_index[:, ~val_pos_mask]
+    
+    test_pos_mask = test_data.edge_label.bool()
+    test_pos_edges = test_data.edge_label_index[:, test_pos_mask]
+    test_neg_edges = test_data.edge_label_index[:, ~test_pos_mask]
+    
+    # 生成训练集的负边
+    # 需要排除所有已观察到的边（包括训练、验证、测试集的正边）
+    all_pos_edges = torch.cat([edge_train, val_pos_edges, test_pos_edges], dim=1)
+    train_edges_neg = negative_sampling(edge_index=all_pos_edges, num_nodes=num_nodes, num_neg_samples=edge_train.size(1))
+    
+    pos_edges = (edge_train, val_pos_edges, test_pos_edges)
+    neg_edges = (train_edges_neg, val_neg_edges, test_neg_edges)
+    
+    return pos_edges, neg_edges
 
 def bin_feat(feat, bins):
     digitized = np.digitize(feat, bins)

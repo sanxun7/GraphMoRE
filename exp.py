@@ -5,7 +5,7 @@ import torch.nn as nn
 from models import *
 from backbone import GNNClassifier
 from utils import cal_accuracy, cal_F1, cal_AUC_AP, cal_shortest_dis
-from data_factory import load_data, mask_edges, load_synthetic_data
+from data_factory import load_data, mask_edges, mask_edges_random, load_synthetic_data
 from logger import create_logger
 from geoopt.optim import RiemannianAdam
 import time
@@ -44,7 +44,18 @@ class Exp:
 
         val_prop = 0.05
         test_prop = 0.1
-        self.pos_edges, self.neg_edges = mask_edges(self.edge_index, self.neg_edge, val_prop, test_prop)
+        # 对于标准数据集（Cora, Citeseer, Pubmed, airport, photo），使用随机划分
+        # 对于合成数据，使用顺序划分（保持原有逻辑）
+        if "synthetic" in self.configs.dataset:
+            self.pos_edges, self.neg_edges = mask_edges(self.edge_index, self.neg_edge, val_prop, test_prop)
+        else:
+            num_nodes = self.features.shape[0]
+            # RandomLinkSplit 需要在 CPU 上处理，之后再将结果移到 device
+            edge_index_cpu = self.edge_index.cpu()
+            pos_edges, neg_edges = mask_edges_random(edge_index_cpu, num_nodes, val_prop, test_prop, seed=3047)
+            # 将结果移回 device
+            self.pos_edges = tuple(edges.to(device) for edges in pos_edges)
+            self.neg_edges = tuple(edges.to(device) for edges in neg_edges)
         self.subgraph_sampler = Sampler(method = "ego", sample_hop = self.configs.sample_hop, dataset = self.configs.dataset, configs = self.configs)
 
 
