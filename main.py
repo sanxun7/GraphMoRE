@@ -50,6 +50,9 @@ parser.add_argument('--patience_lp', type=int, default=100)
 parser.add_argument('--min_epoch_lp', type=int, default=200)
 parser.add_argument('--t', type=float, default=1., help='for Fermi-Dirac decoder')
 parser.add_argument('--r', type=float, default=2., help='Fermi-Dirac decoder')
+parser.add_argument('--edge_split_method', type=str, default='random', 
+                    choices=['random', 'manual'], 
+                    help='Edge splitting method: random (RandomLinkSplit) or manual (process.py style)')
 
 # Node Classification
 parser.add_argument('--drop_cls', type=float, default=0.0)
