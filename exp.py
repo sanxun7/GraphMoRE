@@ -44,7 +44,7 @@ class Exp:
 
         val_prop = 0.05
         test_prop = 0.1
-        # 对于标准数据集（Cora, Citeseer, Pubmed, airport, photo），根据配置选择划分方式
+        # 对于标准数据集（Cora, Citeseer, Pubmed, Coauthor-CS, Coauthor-Physics, github, airport, photo, computers, BlogCatalog, Flickr, Facebook），根据配置选择划分方式
         # 对于合成数据，使用顺序划分（保持原有逻辑）
         if "synthetic" in self.configs.dataset:
             self.pos_edges, self.neg_edges = mask_edges(self.edge_index, self.neg_edge, val_prop, test_prop)
