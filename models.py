@@ -108,90 +108,43 @@ class Gating(nn.Module):
         self.configs = configs
         self.dis_edge = None
         self.dis = None
+        self.rl_hop_mask = None
+        self.rl_curv_bias = None
 
-    def forward(self, subgraph_x, subgraph_edge_index, subgraph_batch,
-                embeddings = None, dis_shortest = None, emb_dim = None, edge_index = None, feature = None,
-                rl_agent = None, rl_return_info: bool = False, rl_collect: bool = False,
-                override_reps_per_hop=None):
-        """
-        门控网络前向：
-        - 常规路径：计算每个尺度的图表示并拼接后分类 -> expert 权重。
-        - RL 集成（可选）：如提供 rl_agent，则基于各尺度表示构造多分辨率状态，
-          由策略选择一个尺度并产生连续“提示”向量，对应尺度表示将被加性调整后再进行分类。
+    def set_rl_inputs(self, hop_mask=None, curvature_bias=None):
+        """提供强化学习输出的尺度权重与曲率偏置。"""
+        self.rl_hop_mask = hop_mask
+        self.rl_curv_bias = curvature_bias
 
-        参数：
-          - subgraph_x/edge_index/batch: 列表形式，长度为尺度数 H。
-          - embeddings/dis_shortest/emb_dim/edge_index: 用于失真正则（Distortion）的一组上下文。
-          - rl_agent: 可选，传入 hppo_mrs.H_PPO_MRS 实例以启用 H-PPO 策略。
-          - rl_return_info: 若为 True，则附带返回用于训练 RL 的中间信息。
-        返回：
-          - 无 embeddings: 返回 expert 权重 (N, num_experts)
-          - 有 embeddings: 返回 (expert 权重, 失真损失)
-          - 若 rl_return_info=True，以上返回末尾附加 rl_info 字典
-        """
-        # 允许外部覆盖 per-hop 表示，以便进行多步 RL 采样（避免重复编码）
-        if override_reps_per_hop is not None:
-            per_hop_reps = override_reps_per_hop
-        else:
-            per_hop_reps = []
-            for i in range(len(subgraph_x)):
-                # 计算每个尺度的节点级表示 -> 节点池化为中心节点（batch）级表示
-                x_scale = self.encoder1(subgraph_x[i], subgraph_edge_index[i])
-                x_scale = self.encoder2(x_scale, subgraph_edge_index[i])
-                x_scale = self.pooling(x_scale, subgraph_batch[i])
-                per_hop_reps.append(x_scale)  # (N, D)
-
-        rl_info = None
-        # ===== 可选：接入 H-PPO 多分辨率策略 ===== #
-        if rl_agent is not None:
-            # 构造状态 (N,H,D)
-            state = rl_agent.build_state_from_reps(per_hop_reps)
-            # 训练采样 or 推理动作
-            if rl_collect:
-                a_d, a_c, lp_d, lp_c = rl_agent.sample_actions(0, state)
-                action_d, action_c = a_d, a_c
-            else:
-                action_d, action_c = rl_agent.eval_actions(state)
-            # 将动作应用到选定尺度的表示上（加性偏置）
-            next_reps = rl_agent.apply_actions_to_reps(per_hop_reps, action_d, action_c)
-            # 用修改后的表示继续分类
-            per_hop_reps = next_reps
-            if rl_return_info:
-                rl_info = {
-                    'state': state.detach(),
-                    'action_d': action_d.detach(),
-                    'action_c': action_c.detach(),
-                    'logprob_d': (lp_d.detach() if rl_collect else None),
-                    'logprob_c': (lp_c.detach() if rl_collect else None),
-                    'next_reps': [r.detach() for r in next_reps],
-                }
-        else:
-            if rl_return_info:
-                # 返回编码后的 per-hop 表示，供 baseline/多步采样使用
-                rl_info = {
-                    'reps': [r.detach() for r in per_hop_reps]
-                }
-
-        # 拼接各尺度表示后进行门控分类
-        x_cat = torch.cat(per_hop_reps, dim=-1)
-        out = self.classifier(x_cat)
+    def forward(self, subgraph_x, subgraph_edge_index, subgraph_batch, embeddings = None, dis_shortest = None, emb_dim = None, edge_index = None, feature = None):
+        x = []
+        for i in range(len(subgraph_x)):
+            x_scale = self.encoder1(subgraph_x[i], subgraph_edge_index[i])
+            x_scale = self.encoder2(x_scale, subgraph_edge_index[i])
+            x_scale = self.pooling(x_scale, subgraph_batch[i])
+            if self.rl_hop_mask is not None and i < len(self.rl_hop_mask):
+                x_scale = x_scale * self.rl_hop_mask[i]
+            x.append(x_scale)
+        x = torch.cat(x, -1)
+        out = self.classifier(x)
         temperature = 1.0
         out = F.softmax(out / temperature, dim=-1)
-        if embeddings is None:
-            if rl_return_info:
-                return out, rl_info
+        if self.rl_curv_bias is not None:
+            bias = self.rl_curv_bias.to(out.device).to(out.dtype)
+            out = out * bias.unsqueeze(0)
+            out = out / out.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        if embeddings == None:
             return out
 
         loss_distortion = self.compute_distortion(out, embeddings, dis_shortest, emb_dim, edge_index)
-        if rl_return_info:
-            return out, loss_distortion, rl_info
         return out, loss_distortion
 
     def compute_distortion(self, expert_weights, embeddings, dis_shortest, emb_dim, edge_index):
         if self.dis_edge == None or self.dis_edge.shape != edge_index.shape or torch.any(self.dis_edge != edge_index):
             self.dis_edge = edge_index
             edges = [(edge_index[0][i].item(), edge_index[1][i].item()) for i in range(edge_index.size(1))]
-            self.dis = torch.tensor([dis_shortest[edge] for edge in edges]).cuda()
+            device = embeddings.device if embeddings.is_cuda else edge_index.device
+            self.dis = torch.tensor([dis_shortest[edge] for edge in edges], device=device, dtype=embeddings.dtype)
 
         diff = (embeddings[edge_index[0]] - embeddings[edge_index[1]])**2
         diff = diff.reshape(diff.shape[0], diff.shape[1]//emb_dim, emb_dim).sum(dim=2)
@@ -254,11 +207,28 @@ class Sampler():
         G.add_nodes_from(range(feature.shape[0]))
         edges = [(edge_index[0][i].item(), edge_index[1][i].item()) for i in range(edge_index.size(1))]
         G.add_edges_from(edges)
+        # 可选：对节点进行抽样，降低单次拼接规模，避免 OOM
+        all_nodes = list(G.nodes())
+        target_nodes = all_nodes
+        try:
+            ratio = getattr(self.configs, "sample_node_ratio", None)
+            cap = getattr(self.configs, "sample_node_cap", None)
+            if ratio is not None:
+                target_count = max(1, int(len(all_nodes) * float(ratio)))
+                if cap is not None:
+                    target_count = min(target_count, int(cap))
+                if target_count < len(all_nodes):
+                    target_nodes = random.sample(all_nodes, target_count)
+            elif cap is not None and cap < len(all_nodes):
+                target_nodes = random.sample(all_nodes, int(cap))
+        except Exception:
+            target_nodes = all_nodes
+
         new_features = []
         new_edge_indices = []
         offset = 0 
         batches = []
-        for node in G.nodes():
+        for node in target_nodes:
             subgraph = nx.ego_graph(G, node, radius=k_hop)
             subgraph_feature = feature[[node for node in subgraph.nodes]]
             new_features.append(subgraph_feature)
@@ -272,8 +242,9 @@ class Sampler():
             subgraph_batch = torch.tensor([node]*subgraph_feature.shape[0], dtype=torch.long)
             batches.append(subgraph_batch)
 
-        new_feature = torch.cat(new_features, dim=0).cuda()
-        new_edge_index = torch.cat(new_edge_indices, dim=1).cuda()
-        batch = torch.cat(batches, dim=0).cuda()
+        device = feature.device
+        new_feature = torch.cat(new_features, dim=0).to(device)
+        new_edge_index = torch.cat(new_edge_indices, dim=1).to(device)
+        batch = torch.cat(batches, dim=0).to(device)
 
         return new_feature, new_edge_index, batch
