@@ -22,6 +22,7 @@ class Exp:
             self.device = torch.device('cuda')
         else:
             self.device = torch.device('cpu')
+            
         self.rl_controller = None
         self.rl_prev_objective = None
         self.rl_prev_metric = None
@@ -217,7 +218,14 @@ class Exp:
             if self.rl_controller is not None:
                 rl_state = self._build_rl_state()
                 hop_mask, curv_bias = self.rl_controller.act(rl_state)
-                model_gating.set_rl_inputs(hop_mask=hop_mask.to(self.device), curvature_bias=curv_bias.to(self.device))
+                # 根据控制模式选择性地传递参数
+                control_mode = getattr(self.configs, 'rl_control_mode', 'both')
+                if control_mode == 'hop_only':
+                    model_gating.set_rl_inputs(hop_mask=hop_mask.to(self.device), curvature_bias=None)
+                elif control_mode == 'curv_only':
+                    model_gating.set_rl_inputs(hop_mask=None, curvature_bias=curv_bias.to(self.device))
+                else:  # both
+                    model_gating.set_rl_inputs(hop_mask=hop_mask.to(self.device), curvature_bias=curv_bias.to(self.device))
             else:
                 model_gating.set_rl_inputs(None, None)
 
@@ -282,6 +290,11 @@ class Exp:
                                     hidden_features=self.configs.hidden_features_cls, out_features=self.n_classes,
                                     n_heads=self.configs.n_heads, drop_edge=self.configs.drop_edge_cls, 
                                     drop_node=self.configs.drop_cls).to(self.device)
+        
+        # 多GPU包装分类器
+        if self.use_multi_gpu and self.device_ids is not None:
+            model_cls = nn.DataParallel(model_cls, device_ids=self.device_ids)
+            
         optimizer_cls = torch.optim.Adam(model_cls.parameters(), lr=self.configs.lr_cls, weight_decay=self.configs.w_decay_cls)
         r_optim = RiemannianAdam(model.parameters(), lr=self.configs.lr_Riemann, weight_decay=self.configs.w_decay, stabilize=100)
         optimizer_gating = torch.optim.Adam(model_gating.parameters(), lr=self.configs.lr_gating, weight_decay=self.configs.w_decay_gating)
@@ -326,7 +339,14 @@ class Exp:
                     self.rl_controller.actor_cs[i].log_std = torch.ones(self.rl_controller.num_curvatures, device=self.device) * new_log_std
                 rl_state = self._build_rl_state()
                 hop_mask, curv_bias = self.rl_controller.act(rl_state)
-                model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
+                # 根据控制模式选择性地传递参数
+                control_mode = getattr(self.configs, 'rl_control_mode', 'both')
+                if control_mode == 'hop_only':
+                    model_gating.set_rl_inputs(hop_mask.to(self.device), None)
+                elif control_mode == 'curv_only':
+                    model_gating.set_rl_inputs(None, curv_bias.to(self.device))
+                else:  # both
+                    model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
             
             embeddings = model.encode(self.features, self.edge_index, self.configs.dataset)
             experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
@@ -353,7 +373,7 @@ class Exp:
                 model_gating.eval()
 
                 embeddings = model.encode(self.features, self.edge_index)
-                experts_weight = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch)
+                experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
                 experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
                 embeddings = embeddings * experts_weight
                 features = torch.concat([self.features, embeddings], -1)
@@ -457,7 +477,14 @@ class Exp:
                     self.rl_controller.actor_cs[i].log_std = torch.ones(self.rl_controller.num_curvatures, device=self.device) * new_log_std
                 rl_state = self._build_rl_state()
                 hop_mask, curv_bias = self.rl_controller.act(rl_state)
-                model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
+                # 根据控制模式选择性地传递参数
+                control_mode = getattr(self.configs, 'rl_control_mode', 'both')
+                if control_mode == 'hop_only':
+                    model_gating.set_rl_inputs(hop_mask.to(self.device), None)
+                elif control_mode == 'curv_only':
+                    model_gating.set_rl_inputs(None, curv_bias.to(self.device))
+                else:  # both
+                    model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
 
             embeddings = model(self.features, pos_edges[0])
             experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
@@ -475,7 +502,7 @@ class Exp:
                 model.eval()
                 model_gating.eval()
                 embeddings = model(self.features, pos_edges[0])
-                experts_weight = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch)
+                experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
 
                 val_loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[1], neg_edges[1])
                 logger.info(f"Epoch {epoch}: val_AUC={auc}, val_AP={ap}")
@@ -520,5 +547,3 @@ class Exp:
             self.rl_controller.end_episode()
 
         return best_test_auc, best_test_ap, best_epoch, best_val_loss, best_test_loss, last_val_auc
-            
-        

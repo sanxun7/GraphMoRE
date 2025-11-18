@@ -48,6 +48,9 @@ parser.add_argument('--coef_dis', type=float, default=0.1)
 parser.add_argument('--rl_enable', dest='rl_enable', action='store_true', help='开启强化学习的多尺度控制')
 parser.add_argument('--no_rl', dest='rl_enable', action='store_false', help='关闭强化学习控制')
 parser.set_defaults(rl_enable=True)
+parser.add_argument('--rl_control_mode', type=str, default='both', 
+                    choices=['both', 'hop_only', 'curv_only'],
+                    help='强化学习控制模式: both(两者都控制), hop_only(只控制多分辨率采样), curv_only(只控制曲率空间选择)')
 parser.add_argument('--rl_state_dim', type=int, default=5, help='强化学习状态长度')
 parser.add_argument('--rl_actor_d_lr', type=float, default=5e-4, help='离散策略学习率')
 parser.add_argument('--rl_actor_c_lr', type=float, default=5e-4, help='连续策略学习率')
@@ -93,23 +96,31 @@ parser.add_argument('--epochs_cls', type=int, default=5000)
 parser.add_argument('--patience_cls', type=int, default=100)
 parser.add_argument('--min_epoch_cls', type=int, default=200)
 
-# Sampler 控制（缓解 OOM）
-parser.add_argument('--sample_node_ratio', type=float, default=None, help='每次为子图采样的节点比例（0-1），默认不过滤')
-parser.add_argument('--sample_node_cap', type=int, default=None, help='每次为子图采样的最大节点数上限，默认不过滤')
-
-
 # GPU
-parser.add_argument('--gpu', type=int, default=0, help='gpu')
-parser.add_argument('--devices', type=str, default='0,1', help='device ids of multile gpus')
+parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
 
 
 configs = parser.parse_args()
+
+os.environ['CUDA_VISIBLE_DEVICES'] = str(configs.gpu)
 configs.num_factors = len(configs.init_curvs)
 configs.num_factors_cls = configs.num_factors
 
+# 根据RL控制模式确定日志文件后缀
+if not configs.rl_enable:
+    rl_suffix = "origin"
+elif configs.rl_control_mode == "both":
+    rl_suffix = "RL"
+elif configs.rl_control_mode == "hop_only":
+    rl_suffix = "hop"
+elif configs.rl_control_mode == "curv_only":
+    rl_suffix = "curv"
+else:
+    rl_suffix = "RL"  # 默认
+
 results_dir = f"./results/{configs.version}"
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}_{timestamp}.log"
+log_path = f"{results_dir}/{configs.downstream_task}_{configs.backbone}_{configs.dataset}_{rl_suffix}_{timestamp}.log"
 
 configs.log_path = log_path
 if not os.path.exists("./results"):
@@ -120,6 +131,26 @@ if not os.path.exists(results_dir):
 
 logger = create_logger(configs.log_path)
 logger.info(configs)
+
+# 打印清晰的RL控制模式信息
+logger.info("="*80)
+if not configs.rl_enable:
+    logger.info("🔧 RL Control Mode: ORIGIN (No RL Control)")
+    logger.info("   - Multi-resolution Sampling: Normal Mode")
+    logger.info("   - Curvature Space Selection: Normal Mode")
+elif configs.rl_control_mode == "both":
+    logger.info("🤖 RL Control Mode: RL (Full RL Control)")
+    logger.info("   - Multi-resolution Sampling: RL Controlled ✓")
+    logger.info("   - Curvature Space Selection: RL Controlled ✓")
+elif configs.rl_control_mode == "hop_only":
+    logger.info("🎯 RL Control Mode: HOP (Multi-resolution Only)")
+    logger.info("   - Multi-resolution Sampling: RL Controlled ✓")
+    logger.info("   - Curvature Space Selection: Normal Mode")
+elif configs.rl_control_mode == "curv_only":
+    logger.info("📐 RL Control Mode: CURV (Curvature Only)")
+    logger.info("   - Multi-resolution Sampling: Normal Mode")
+    logger.info("   - Curvature Space Selection: RL Controlled ✓")
+logger.info("="*80)
 
 exp = Exp(configs)
 exp.train()

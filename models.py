@@ -133,6 +133,7 @@ class Gating(nn.Module):
             bias = self.rl_curv_bias.to(out.device).to(out.dtype)
             out = out * bias.unsqueeze(0)
             out = out / out.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        
         if embeddings == None:
             return out
 
@@ -200,51 +201,38 @@ class Sampler():
                 new_edge_index_list.append(new_edge_index)
                 batch_list.append(batch)
             return new_feature_list, new_edge_index_list, batch_list
-        return None
+        return None, None, None
     
     def sample_ego(self, feature, edge_index, k_hop):
         G = nx.Graph()
         G.add_nodes_from(range(feature.shape[0]))
         edges = [(edge_index[0][i].item(), edge_index[1][i].item()) for i in range(edge_index.size(1))]
         G.add_edges_from(edges)
-        # 可选：对节点进行抽样，降低单次拼接规模，避免 OOM
-        all_nodes = list(G.nodes())
-        target_nodes = all_nodes
-        try:
-            ratio = getattr(self.configs, "sample_node_ratio", None)
-            cap = getattr(self.configs, "sample_node_cap", None)
-            if ratio is not None:
-                target_count = max(1, int(len(all_nodes) * float(ratio)))
-                if cap is not None:
-                    target_count = min(target_count, int(cap))
-                if target_count < len(all_nodes):
-                    target_nodes = random.sample(all_nodes, target_count)
-            elif cap is not None and cap < len(all_nodes):
-                target_nodes = random.sample(all_nodes, int(cap))
-        except Exception:
-            target_nodes = all_nodes
 
         new_features = []
         new_edge_indices = []
         offset = 0 
         batches = []
-        for node in target_nodes:
+        for batch_idx, node in enumerate(G.nodes()):
             subgraph = nx.ego_graph(G, node, radius=k_hop)
             subgraph_feature = feature[[node for node in subgraph.nodes]]
+            new_node_indices = {n: idx + offset for idx, n in enumerate(subgraph.nodes)}
+            edge_list = [[new_node_indices[u], new_node_indices[v]] for u, v in subgraph.edges()]
+            if len(edge_list) > 0:
+                subgraph_edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            else:
+                subgraph_edge_index = torch.empty((2, 0), dtype=torch.long)
+            
             new_features.append(subgraph_feature)
-            new_node_indices = {node: idx + offset for idx, node in enumerate(subgraph.nodes)}
-            subgraph_edge_index = torch.tensor(
-                [[new_node_indices[u], new_node_indices[v]] for u, v in subgraph.edges()],
-                dtype=torch.long
-            ).t()
             new_edge_indices.append(subgraph_edge_index)
-            offset += len(new_node_indices)  
-            subgraph_batch = torch.tensor([node]*subgraph_feature.shape[0], dtype=torch.long)
+            offset += subgraph_feature.shape[0]
+            
+            subgraph_batch = torch.tensor([batch_idx] * subgraph_feature.shape[0], dtype=torch.long)
             batches.append(subgraph_batch)
 
         device = feature.device
         new_feature = torch.cat(new_features, dim=0).to(device)
-        new_edge_index = torch.cat(new_edge_indices, dim=1).to(device)
+        new_edge_index = torch.cat(new_edge_indices, dim=1).to(device) if len(new_edge_indices) > 0 else torch.empty((2, 0), dtype=torch.long, device=device)
         batch = torch.cat(batches, dim=0).to(device)
 
         return new_feature, new_edge_index, batch
