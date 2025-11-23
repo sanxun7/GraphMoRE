@@ -16,8 +16,8 @@ np.random.seed(seed)
 parser = argparse.ArgumentParser(description='')
 
 # Experiment settings
-parser.add_argument('--downstream_task', type=str, default='NC',
-                    choices=['NC', 'LP'])
+parser.add_argument('--downstream_task', type=str, default='NC', choices=['NC', 'LP'], help='下游任务: NC(节点分类) 或 LP(链路预测)')
+parser.add_argument('--skip_lp_pretrain', action='store_true', help='NC任务时跳过LP预训练，直接运行NC')
 parser.add_argument('--dataset', type=str)
 parser.add_argument('--root_path', type=str, default='./datasets')
 parser.add_argument('--in_features', type=int)
@@ -54,7 +54,7 @@ parser.add_argument('--rl_control_mode', type=str, default='both',
 parser.add_argument('--rl_state_dim', type=int, default=5, help='强化学习状态长度')
 parser.add_argument('--rl_actor_d_lr', type=float, default=5e-4, help='离散策略学习率')
 parser.add_argument('--rl_actor_c_lr', type=float, default=5e-4, help='连续策略学习率')
-parser.add_argument('--rl_critic_lr', type=float, default=1e-3, help='价值网络学习率')
+parser.add_argument('--rl_critic_lr', type=float, default=5e-4, help='价值网络学习率')
 parser.add_argument('--rl_eps_clip_d', type=float, default=0.2, help='离散策略裁剪阈值')
 parser.add_argument('--rl_eps_clip_c', type=float, default=0.2, help='连续策略裁剪阈值')
 parser.add_argument('--rl_entropy_coef', type=float, default=0.01, help='熵正则系数')
@@ -63,15 +63,21 @@ parser.add_argument('--rl_temperature', type=float, default=1.0, help='连续动
 parser.add_argument('--rl_max_action', type=float, default=1.0, help='连续动作范围')
 parser.add_argument('--rl_init_log_std', type=float, default=0.0, help='连续策略初始对数方差')
 parser.add_argument('--rl_target_log_std', type=float, default=-5.0, help='方差退火的目标对数方差')
-parser.add_argument('--rl_batch_size', type=int, default=4, help='累计多少迭代后更新H-PPO')
+parser.add_argument('--rl_batch_size', type=int, default=8, help='累计多少迭代后更新H-PPO')
+parser.add_argument('--rl_minibatch_size', type=int, default=128, help='每次策略更新的minibatch大小')
+parser.add_argument('--rl_policy_update_nums', type=int, default=10, help='每次收集经验后最多更新策略的次数')
 parser.add_argument('--rl_reward_scale', type=float, default=1.0, help='奖励缩放系数')
+parser.add_argument('--rl_use_reward_scaling', action='store_true', help='是否使用reward scaling normalization')
+parser.set_defaults(rl_use_reward_scaling=True)
 parser.add_argument('--rl_aux_lp_coef', type=float, default=0.2, help='分类任务下LP奖励的混合比')
 parser.add_argument('--rl_max_grad_norm', type=float, default=0.5, help='梯度裁剪阈值')
-parser.add_argument('--rl_gamma', type=float, default=0.95, help='强化学习折扣因子')
-parser.add_argument('--rl_lambda', type=float, default=0.9, help='GAE 的 lambda 系数')
-parser.add_argument('--rl_ensemble_num', type=int, default=1, help='策略集成的子 actor 数量')
-parser.add_argument('--rl_penalty_alpha_d', type=float, default=0.0, help='离散策略与集成分布的KL约束系数')
-parser.add_argument('--rl_penalty_alpha_c', type=float, default=0.0, help='连续策略与集成分布的KL约束系数')
+parser.add_argument('--rl_gamma', type=float, default=0.99, help='强化学习折扣因子')
+parser.add_argument('--rl_lambda', type=float, default=0.95, help='GAE 的 lambda 系数')
+parser.add_argument('--rl_target_kl_d', type=float, default=0.001, help='离散策略KL散度early stopping阈值')
+parser.add_argument('--rl_target_kl_c', type=float, default=0.1, help='连续策略KL散度early stopping阈值')
+parser.add_argument('--rl_ensemble_num', type=int, default=3, help='策略集成的子 actor 数量')
+parser.add_argument('--rl_penalty_alpha_d', type=float, default=1e5, help='离散策略与集成分布的KL约束系数')
+parser.add_argument('--rl_penalty_alpha_c', type=float, default=1e-1, help='连续策略与集成分布的KL约束系数')
 parser.add_argument('--rl_reward_type', type=str, default='loss', choices=['loss', 'metric'],
                     help='强化学习奖励类型：loss 使用验证损失下降量，metric 使用下游指标提升量')
 
@@ -98,6 +104,9 @@ parser.add_argument('--min_epoch_cls', type=int, default=200)
 
 # GPU
 parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
+parser.add_argument('--use_amp', dest='use_amp', action='store_true', help='使用混合精度训练以节省显存')
+parser.add_argument('--no_amp', dest='use_amp', action='store_false', help='不使用混合精度训练')
+parser.set_defaults(use_amp=False)
 
 
 configs = parser.parse_args()
@@ -150,6 +159,12 @@ elif configs.rl_control_mode == "curv_only":
     logger.info("📐 RL Control Mode: CURV (Curvature Only)")
     logger.info("   - Multi-resolution Sampling: Normal Mode")
     logger.info("   - Curvature Space Selection: RL Controlled ✓")
+logger.info("="*80)
+if configs.use_amp:
+    logger.info("⚡ Mixed Precision Training: ENABLED (AMP)")
+    logger.info("   - Expected memory saving: 30-40%")
+else:
+    logger.info("⚡ Mixed Precision Training: DISABLED")
 logger.info("="*80)
 
 exp = Exp(configs)

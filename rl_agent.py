@@ -237,8 +237,10 @@ class MultiScaleHPPOController:
         if self.pending is None:
             return
         dtype = self.pending["state"].dtype
-        reward_tensor = torch.tensor([[reward * self.configs.rl_reward_scale]], device=self.device, dtype=dtype)
-        done_tensor = torch.tensor([[1.0 if done else 0.0]], device=self.device, dtype=dtype)
+        # Ensure reward tensor matches the shape of other tensors [batch_size, 1]
+        batch_size = self.pending["state"].size(0)
+        reward_tensor = torch.full((batch_size, 1), reward, device=self.device, dtype=dtype)
+        done_tensor = torch.full((batch_size, 1), 1.0 if done else 0.0, device=self.device, dtype=dtype)
         entry = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in self.pending.items()}
         entry["reward"] = reward_tensor
         entry["done"] = done_tensor
@@ -327,53 +329,110 @@ class MultiScaleHPPOController:
     def _update(self):
         data = self.buffer.as_tensors()
         advantages, returns = self._compute_advantages(data["reward"], data["value"], data["done"])
+        
+        # [Trick] Advantage normalization over the whole batch
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        total_samples = data["state"].size(0)
+        minibatch_size = min(getattr(self.configs, "rl_minibatch_size", 128), total_samples)
+        policy_update_nums = getattr(self.configs, "rl_policy_update_nums", 10)
+        target_kl_d = getattr(self.configs, "rl_target_kl_d", None)
+        target_kl_c = getattr(self.configs, "rl_target_kl_c", None)
 
         # ===== 分别更新每个子 actor，带 KL 约束与熵系数 =====
         for a_idx in range(self.ensemble_num):
-            # discrete
-            logprob_new_d, entropy_d = self.actor_ds[a_idx].logprob_entropy(data["state"], data["action_d"].squeeze(-1), data["mask"])
-            ratios_d = torch.exp(logprob_new_d - data["logprob_d"].squeeze(-1))
-            surr1_d = ratios_d * advantages
-            surr2_d = torch.clamp(ratios_d, 1 - self.configs.rl_eps_clip_d, 1 + self.configs.rl_eps_clip_d) * advantages
-            ens_pen_d, ens_action_d = (0.0, None)
-            if self.ensemble_num > 1 and self.penalty_alpha_d > 0:
-                ens_pen_d, ens_action_d = self._ensemble_penalty_d(a_idx, data["state"], data["mask"])
-            loss_d = -(torch.min(surr1_d, surr2_d)).mean() - self.coeff_ent_d * entropy_d.mean()
-            if isinstance(ens_pen_d, torch.Tensor):
-                loss_d = loss_d + ens_pen_d.mean()
-            self.opt_d[a_idx].zero_grad()
-            loss_d.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor_ds[a_idx].parameters(), self.configs.rl_max_grad_norm)
-            self.opt_d[a_idx].step()
-
-            # continuous
-            logprob_new_c, entropy_c = self.actor_cs[a_idx].logprob_entropy(data["state"], data["action_d"].squeeze(-1), data["action_c"])
-            ratios_c = torch.exp(logprob_new_c - data["logprob_c"].squeeze(-1))
-            surr1_c = ratios_c * advantages
-            surr2_c = torch.clamp(ratios_c, 1 - self.configs.rl_eps_clip_c, 1 + self.configs.rl_eps_clip_c) * advantages
-            ens_pen_c = 0.0
-            if self.ensemble_num > 1 and self.penalty_alpha_c > 0:
-                # 若上一步未计算离散的 ens_action_d，就从最大概率分布取
-                if ens_action_d is None:
+            # Minibatch multi-epoch update with early stopping
+            for update_epoch in range(policy_update_nums):
+                # Randomly shuffle data for each epoch
+                indices = torch.randperm(total_samples, device=self.device)
+                kl_d_sum, kl_c_sum = 0.0, 0.0
+                num_minibatches = 0
+                
+                for start_idx in range(0, total_samples, minibatch_size):
+                    end_idx = min(start_idx + minibatch_size, total_samples)
+                    mb_indices = indices[start_idx:end_idx]
+                    
+                    # Extract minibatch
+                    mb_state = data["state"][mb_indices]
+                    mb_action_d = data["action_d"][mb_indices].squeeze(-1)
+                    mb_action_c = data["action_c"][mb_indices]
+                    mb_mask = data["mask"][mb_indices]
+                    mb_logprob_old_d = data["logprob_d"][mb_indices].squeeze(-1)
+                    mb_logprob_old_c = data["logprob_c"][mb_indices].squeeze(-1)
+                    mb_adv = advantages[mb_indices]
+                    mb_ret = returns[mb_indices]
+                    
+                    # ====== Discrete actor loss ====== #
+                    logprob_new_d, entropy_d = self.actor_ds[a_idx].logprob_entropy(mb_state, mb_action_d, mb_mask)
+                    ratios_d = torch.exp(logprob_new_d - mb_logprob_old_d)
+                    surr1_d = ratios_d * mb_adv
+                    surr2_d = torch.clamp(ratios_d, 1 - self.configs.rl_eps_clip_d, 1 + self.configs.rl_eps_clip_d) * mb_adv
+                    
+                    ens_pen_d, ens_action_d = (0.0, None)
+                    if self.ensemble_num > 1 and self.penalty_alpha_d > 0:
+                        ens_pen_d, ens_action_d = self._ensemble_penalty_d(a_idx, mb_state, mb_mask)
+                    
+                    loss_d = -(torch.min(surr1_d, surr2_d)).mean() - self.coeff_ent_d * entropy_d.mean()
+                    if isinstance(ens_pen_d, torch.Tensor):
+                        loss_d = loss_d + ens_pen_d.mean()
+                    
+                    # Compute approx KL for early stopping
                     with torch.no_grad():
-                        probs_list = [self.actor_ds[i].forward(data["state"], data["mask"]) for i in range(self.ensemble_num)]
-                        max_probs = torch.stack(probs_list, dim=1).max(dim=1)[0]
-                        ens_action_d = torch.argmax(max_probs, dim=-1)
-                ens_pen_c = self._ensemble_penalty_c(a_idx, data["state"], ens_action_d)
-            loss_c = -(torch.min(surr1_c, surr2_c)).mean() - self.configs.rl_entropy_coef * entropy_c.mean()
-            if isinstance(ens_pen_c, torch.Tensor):
-                loss_c = loss_c + ens_pen_c.mean()
-            self.opt_c[a_idx].zero_grad()
-            loss_c.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor_cs[a_idx].parameters(), self.configs.rl_max_grad_norm)
-            self.opt_c[a_idx].step()
-
-        # ===== 更新价值网络 =====
-        values = self.critic(data["state"])
-        loss_v = F.mse_loss(values, returns.unsqueeze(-1))
-        self.opt_v.zero_grad()
-        loss_v.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.configs.rl_max_grad_norm)
-        self.opt_v.step()
+                        approx_kl_d = ((ratios_d - 1) - (logprob_new_d - mb_logprob_old_d)).mean()
+                        kl_d_sum += approx_kl_d.item()
+                    
+                    self.opt_d[a_idx].zero_grad()
+                    loss_d.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor_ds[a_idx].parameters(), self.configs.rl_max_grad_norm)
+                    self.opt_d[a_idx].step()
+                    
+                    # ====== Continuous actor loss ====== #
+                    logprob_new_c, entropy_c = self.actor_cs[a_idx].logprob_entropy(mb_state, mb_action_d, mb_action_c)
+                    ratios_c = torch.exp(logprob_new_c - mb_logprob_old_c)
+                    surr1_c = ratios_c * mb_adv
+                    surr2_c = torch.clamp(ratios_c, 1 - self.configs.rl_eps_clip_c, 1 + self.configs.rl_eps_clip_c) * mb_adv
+                    
+                    ens_pen_c = 0.0
+                    if self.ensemble_num > 1 and self.penalty_alpha_c > 0:
+                        if ens_action_d is None:
+                            with torch.no_grad():
+                                probs_list = [self.actor_ds[i].forward(mb_state, mb_mask) for i in range(self.ensemble_num)]
+                                max_probs = torch.stack(probs_list, dim=1).max(dim=1)[0]
+                                ens_action_d = torch.argmax(max_probs, dim=-1)
+                        ens_pen_c = self._ensemble_penalty_c(a_idx, mb_state, ens_action_d)
+                    
+                    loss_c = -(torch.min(surr1_c, surr2_c)).mean() - self.configs.rl_entropy_coef * entropy_c.mean()
+                    if isinstance(ens_pen_c, torch.Tensor):
+                        loss_c = loss_c + ens_pen_c.mean()
+                    
+                    # Compute approx KL for early stopping
+                    with torch.no_grad():
+                        approx_kl_c = ((ratios_c - 1) - (logprob_new_c - mb_logprob_old_c)).mean()
+                        kl_c_sum += approx_kl_c.item()
+                    
+                    self.opt_c[a_idx].zero_grad()
+                    loss_c.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor_cs[a_idx].parameters(), self.configs.rl_max_grad_norm)
+                    self.opt_c[a_idx].step()
+                    
+                    # ====== Critic loss ====== #
+                    values = self.critic(mb_state).squeeze(-1)
+                    loss_v = F.mse_loss(values, mb_ret)
+                    
+                    self.opt_v.zero_grad()
+                    loss_v.backward()
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.configs.rl_max_grad_norm)
+                    self.opt_v.step()
+                    
+                    num_minibatches += 1
+                
+                # Check for early stopping based on KL divergence
+                avg_kl_d = kl_d_sum / num_minibatches if num_minibatches > 0 else 0
+                avg_kl_c = kl_c_sum / num_minibatches if num_minibatches > 0 else 0
+                
+                if target_kl_d is not None and avg_kl_d > target_kl_d:
+                    break
+                if target_kl_c is not None and avg_kl_c > target_kl_c:
+                    break
 
         self.buffer.reset()

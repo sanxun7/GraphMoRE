@@ -10,6 +10,7 @@ from data_factory import load_data, mask_edges, mask_edges_random, mask_edges_ma
 from logger import create_logger
 from geoopt.optim import RiemannianAdam
 from rl_agent import MultiScaleHPPOController
+from reward_utils import RewardScaling
 import time
 import os
 from torch_geometric.utils import negative_sampling
@@ -27,6 +28,14 @@ class Exp:
         self.rl_prev_objective = None
         self.rl_prev_metric = None
         self.rl_reward_history = []
+        
+        # 混合精度训练支持
+        self.use_amp = getattr(configs, 'use_amp', False)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        
+        # 多GPU支持（预留）
+        self.use_multi_gpu = False
+        self.device_ids = None
 
     def _init_rl_controller(self):
         """根据配置初始化H-PPO控制器。"""
@@ -35,10 +44,17 @@ class Exp:
             self.rl_controller = MultiScaleHPPOController(self.configs, num_hops, self.configs.num_factors, self.device)
             self.rl_prev_objective = None
             self.rl_prev_metric = None
+            # Initialize reward scaler for normalization
+            if getattr(self.configs, 'rl_use_reward_scaling', True):
+                gamma = getattr(self.configs, 'rl_gamma', 0.99)
+                self.rl_reward_scaler = RewardScaling(shape=1, gamma=gamma)
+            else:
+                self.rl_reward_scaler = None
         else:
             self.rl_controller = None
             self.rl_prev_objective = None
             self.rl_prev_metric = None
+            self.rl_reward_scaler = None
 
     def _build_rl_state(self):
         """提取多尺度子图的简单统计量，作为强化学习的状态输入。"""
@@ -203,10 +219,18 @@ class Exp:
             aps = []
 
 
-        if self.configs.downstream_task == 'LP':
-            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.pos_edges[0], "LP")
+        # 在采样阶段也使用混合精度以节省内存
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                if self.configs.downstream_task == 'LP':
+                    self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.pos_edges[0], "LP")
+                else:
+                    self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.edge_index, "NC")
         else:
-            self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.edge_index, "NC")
+            if self.configs.downstream_task == 'LP':
+                self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.pos_edges[0], "LP")
+            else:
+                self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch = self.subgraph_sampler.sample(self.features, self.edge_index, "NC")
         self._init_rl_controller()
 
         for exp_iter in range(self.configs.exp_iters):
@@ -231,7 +255,12 @@ class Exp:
 
             logger.info("--------------------------Training Start-------------------------")
             if self.configs.downstream_task == 'NC':
-                test_auc, test_ap, _, lp_val_loss, _, lp_val_metric = self.train_lp(model, model_gating, self.pos_edges, self.neg_edges, logger)
+                # 检查是否跳过LP预训练
+                if getattr(self.configs, 'skip_lp_pretrain', False):
+                    logger.info("⚠️  Skipping LP pretraining, directly running NC task")
+                    test_auc, test_ap, lp_val_loss, lp_val_metric = 0, 0, 0, 0
+                else:
+                    test_auc, test_ap, _, lp_val_loss, _, lp_val_metric = self.train_lp(model, model_gating, self.pos_edges, self.neg_edges, logger)
                 best_acc, test_acc, test_weighted_f1, test_macro_f1, best_epoch, cls_val_loss, cls_test_loss, cls_val_metric = self.train_cls(model, model_gating, logger)
                 logger.info(f"best_epoch={best_epoch}")
                 logger.info(
@@ -348,21 +377,36 @@ class Exp:
                 else:  # both
                     model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
             
-            embeddings = model.encode(self.features, self.edge_index, self.configs.dataset)
-            experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
-
-            experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
-            embeddings = embeddings * experts_weight
-
-            features = torch.concat([self.features, embeddings], -1)
-
-            loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[0], features, self.labels)
-            loss = loss + self.configs.coef_dis * loss_distortion 
-
-            loss.backward()
-            optimizer_cls.step()
-            r_optim.step()
-            optimizer_gating.step()
+            # 混合精度训练
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    embeddings = model.encode(self.features, self.edge_index, self.configs.dataset)
+                    experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
+                    experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
+                    embeddings = embeddings * experts_weight
+                    features = torch.concat([self.features, embeddings], -1)
+                    loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[0], features, self.labels)
+                    loss = loss + self.configs.coef_dis * loss_distortion
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer_cls)
+                self.scaler.step(optimizer_gating)
+                self.scaler.update()
+                # RiemannianAdam 不支持 scaler，单独处理
+                r_optim.step()
+            else:
+                embeddings = model.encode(self.features, self.edge_index, self.configs.dataset)
+                experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
+                experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
+                embeddings = embeddings * experts_weight
+                features = torch.concat([self.features, embeddings], -1)
+                loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[0], features, self.labels)
+                loss = loss + self.configs.coef_dis * loss_distortion
+                
+                loss.backward()
+                optimizer_cls.step()
+                r_optim.step()
+                optimizer_gating.step()
             logger.info(f"Epoch {epoch}: train_loss={loss.item()}, train_accuracy={acc}, time={time.time()-now_time}")
 
             step_reward = 0.0
@@ -372,12 +416,22 @@ class Exp:
                 model.eval()
                 model_gating.eval()
 
-                embeddings = model.encode(self.features, self.edge_index)
-                experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
-                experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
-                embeddings = embeddings * experts_weight
-                features = torch.concat([self.features, embeddings], -1)
-                val_loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[1], features, self.labels)
+                with torch.no_grad():
+                    if self.use_amp:
+                        with torch.cuda.amp.autocast():
+                            embeddings = model.encode(self.features, self.edge_index)
+                            experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
+                            experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
+                            embeddings = embeddings * experts_weight
+                            features = torch.concat([self.features, embeddings], -1)
+                            val_loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[1], features, self.labels)
+                    else:
+                        embeddings = model.encode(self.features, self.edge_index)
+                        experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, self.edge_index)
+                        experts_weight = experts_weight.repeat_interleave(self.configs.embed_features, dim=1)
+                        embeddings = embeddings * experts_weight
+                        features = torch.concat([self.features, embeddings], -1)
+                        val_loss, acc, weighted_f1, macro_f1 = self.cal_cls_loss(model_cls, self.edge_index, self.masks[1], features, self.labels)
                 logger.info(f"Epoch {epoch}: val_accuracy={acc}, val_wf1={weighted_f1}, val_mf1={macro_f1}")
                 reward_type = getattr(self.configs, 'rl_reward_type', 'loss')
                 if reward_type == 'metric':
@@ -407,8 +461,19 @@ class Exp:
             if self.rl_controller is not None:
                 if epoch == self.configs.epochs_cls:
                     done_flag = True
-                self.rl_controller.record_reward(step_reward, done_flag)
-                self.rl_reward_history.append(('nc', epoch, step_reward))
+                # Apply reward scaling if enabled
+                scaled_reward = step_reward
+                if self.rl_reward_scaler is not None:
+                    scaled_reward = self.rl_reward_scaler(step_reward)
+                    if isinstance(scaled_reward, np.ndarray):
+                        scaled_reward = float(scaled_reward.item())
+                    if done_flag:
+                        self.rl_reward_scaler.reset()
+                self.rl_controller.record_reward(scaled_reward, done_flag)
+                self.rl_reward_history.append(('nc', epoch, scaled_reward))
+                # 记录RL详细信息
+                if epoch % 100 == 0:
+                    logger.info(f"  [RL] step_reward={step_reward:.6f}, scaled={scaled_reward:.6f}, val_signal={prev_val_signal:.6f}")
             if done_flag:
                 episode_done = True
                 break
@@ -427,8 +492,12 @@ class Exp:
         neg_weights = F.softmax(experts_weight[neg_edges[0]] * experts_weight[neg_edges[1]], dim=1)   
         neg_scores = decoder(torch.sum(neg_diff * neg_weights, -1))
 
-        loss = F.binary_cross_entropy(pos_scores.clip(0.01, 0.99), torch.ones_like(pos_scores)) + \
-                F.binary_cross_entropy(neg_scores.clip(0.01, 0.99), torch.zeros_like(neg_scores))
+        # 禁用autocast以兼容binary_cross_entropy
+        with torch.cuda.amp.autocast(enabled=False):
+            pos_scores_float = pos_scores.float()
+            neg_scores_float = neg_scores.float()
+            loss = F.binary_cross_entropy(pos_scores_float.clip(0.01, 0.99), torch.ones_like(pos_scores_float)) + \
+                    F.binary_cross_entropy(neg_scores_float.clip(0.01, 0.99), torch.zeros_like(neg_scores_float))
         label = [1] * pos_scores.shape[0] + [0] * neg_scores.shape[0]
         preds = list(pos_scores.detach().cpu().numpy()) + list(neg_scores.detach().cpu().numpy())
         auc, ap = cal_AUC_AP(preds, label)
@@ -486,25 +555,47 @@ class Exp:
                 else:  # both
                     model_gating.set_rl_inputs(hop_mask.to(self.device), curv_bias.to(self.device))
 
-            embeddings = model(self.features, pos_edges[0])
-            experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
-            
-            neg_edge_train = neg_edges[0][:, np.random.randint(0, neg_edges[0].shape[1], pos_edges[0].shape[1])]
-            loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[0], neg_edge_train)
-            loss = loss + self.configs.coef_dis * loss_distortion 
-            loss.backward()
-            r_optim.step()
-            optimizer_gating.step()
+            # 混合精度训练
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    embeddings = model(self.features, pos_edges[0])
+                    experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
+                    neg_edge_train = neg_edges[0][:, np.random.randint(0, neg_edges[0].shape[1], pos_edges[0].shape[1])]
+                    loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[0], neg_edge_train)
+                    loss = loss + self.configs.coef_dis * loss_distortion
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer_gating)
+                self.scaler.update()
+                # RiemannianAdam 不支持 scaler，单独处理
+                r_optim.step()
+            else:
+                embeddings = model(self.features, pos_edges[0])
+                experts_weight, loss_distortion = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
+                neg_edge_train = neg_edges[0][:, np.random.randint(0, neg_edges[0].shape[1], pos_edges[0].shape[1])]
+                loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[0], neg_edge_train)
+                loss = loss + self.configs.coef_dis * loss_distortion
+                
+                loss.backward()
+                r_optim.step()
+                optimizer_gating.step()
             logger.info(f"Epoch {epoch}: train_loss={loss.item()}, train_AUC={auc}, train_AP={ap}, time={time.time() - t}")
             step_reward = 0.0
             done_flag = False
             if epoch % self.configs.eval_freq == 0:
                 model.eval()
                 model_gating.eval()
-                embeddings = model(self.features, pos_edges[0])
-                experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
-
-                val_loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[1], neg_edges[1])
+                
+                with torch.no_grad():
+                    if self.use_amp:
+                        with torch.cuda.amp.autocast():
+                            embeddings = model(self.features, pos_edges[0])
+                            experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
+                            val_loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[1], neg_edges[1])
+                    else:
+                        embeddings = model(self.features, pos_edges[0])
+                        experts_weight, _ = model_gating(self.subgraph_feature, self.subgraph_edge_index, self.subgraph_batch, embeddings, self.dis_shortest, self.configs.embed_features, pos_edges[0])
+                        val_loss, auc, ap = self.cal_lp_loss(embeddings, experts_weight, decoder, pos_edges[1], neg_edges[1])
                 logger.info(f"Epoch {epoch}: val_AUC={auc}, val_AP={ap}")
                 reward_type = getattr(self.configs, 'rl_reward_type', 'loss')
                 if reward_type == 'metric':
@@ -537,8 +628,16 @@ class Exp:
             if self.rl_controller is not None:
                 if epoch == self.configs.epochs_lp:
                     done_flag = True
-                self.rl_controller.record_reward(step_reward, done_flag)
-                self.rl_reward_history.append(('lp', epoch, step_reward))
+                # Apply reward scaling if enabled
+                scaled_reward = step_reward
+                if self.rl_reward_scaler is not None:
+                    scaled_reward = self.rl_reward_scaler(step_reward)
+                    if isinstance(scaled_reward, np.ndarray):
+                        scaled_reward = float(scaled_reward.item())
+                    if done_flag:
+                        self.rl_reward_scaler.reset()
+                self.rl_controller.record_reward(scaled_reward, done_flag)
+                self.rl_reward_history.append(('lp', epoch, scaled_reward))
             if done_flag:
                 episode_done = True
                 break
